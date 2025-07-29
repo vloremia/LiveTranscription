@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import {
   LiveConnectionState,
   LiveTranscriptionEvent,
@@ -12,325 +12,264 @@ import {
   MicrophoneState,
   useMicrophone,
 } from "../context/MicrophoneContextProvider";
-import { indexedDBService } from "../services/IndexedDBService";
-import { offlineTranscriptionService } from "../services/OfflineTranscriptionService";
-import Visualizer from "./Visualizer";
-import ChatBar from "./ChatBar";
-import MicrophoneControl from "./MicrophoneControl";
-import OfflineStatus from "./OfflineStatus";
-import OfflineTest from "./OfflineTest";
 
 interface TranscriptionEntry {
   id: string;
   text: string;
   timestamp: Date;
   isFinal: boolean;
-  isFromOffline?: boolean;
 }
 
+// Simple Deepgram configuration
+const DEEPGRAM_CONFIG = {
+  model: "nova-2",
+  interim_results: true,
+  smart_format: true,
+  language: "en-US",
+} as const;
+
 const App: () => JSX.Element = () => {
-  const [caption, setCaption] = useState<string | undefined>(
-    "Powered by Deepgram"
-  );
   const [transcriptions, setTranscriptions] = useState<TranscriptionEntry[]>([]);
-  const [offlineSegments, setOfflineSegments] = useState<number>(0);
-  const [isLoadingOfflineData, setIsLoadingOfflineData] = useState<boolean>(true);
-  const { connection, connectToDeepgram, connectionState, isOfflineMode, networkStatus, disconnectFromDeepgram } = useDeepgram();
-  const { setupMicrophone, microphone, startMicrophone, microphoneState } =
-    useMicrophone();
-  const captionTimeout = useRef<any>();
-  const keepAliveInterval = useRef<any>();
+  const [currentTranscript, setCurrentTranscript] = useState<string>("");
+  
+  const { 
+    connection, 
+    connectToDeepgram, 
+    disconnectFromDeepgram, 
+    connectionState, 
+    isReconnecting 
+  } = useDeepgram();
+  
+  const { 
+    setupMicrophone, 
+    microphone, 
+    microphoneState, 
+    startMicrophone, 
+    stopMicrophone 
+  } = useMicrophone();
 
-  // Load offline transcriptions on mount
-  useEffect(() => {
-    const loadOfflineData = async () => {
-      try {
-        await indexedDBService.init();
-        offlineTranscriptionService.startAutoSync();
-        
-        // Load existing offline transcriptions
-        const offlineTranscripts = await offlineTranscriptionService.getProcessedTranscripts();
-        console.log('Loaded offline transcripts:', offlineTranscripts.length, offlineTranscripts);
-        
-        const offlineEntries = offlineTranscripts.map(offline => ({
-          id: offline.id,
-          text: offline.text,
-          timestamp: offline.timestamp,
-          isFinal: true,
-          isFromOffline: true
-        }));
-        
-        setTranscriptions(prev => {
-          const newTranscriptions = [...prev, ...offlineEntries];
-          console.log('Updated transcriptions with offline data:', newTranscriptions.length, 'total entries');
-          return newTranscriptions;
-        });
-        
-        // Get count of pending segments
-        const pendingCount = await offlineTranscriptionService.getPendingCount();
-        setOfflineSegments(pendingCount);
-        console.log('Pending segments count:', pendingCount);
-      } catch (error) {
-        console.error('Error loading offline data:', error);
-      } finally {
-        setIsLoadingOfflineData(false);
-      }
-    };
-
-    loadOfflineData();
-  }, []);
-
+  // Setup microphone on mount
   useEffect(() => {
     setupMicrophone();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Connect to Deepgram when microphone is ready
   useEffect(() => {
-    if (microphoneState === MicrophoneState.Ready && !isOfflineMode) {
-      connectToDeepgram({
-        model: "nova-3",
-        interim_results: true,
-        smart_format: true,
-        filler_words: true,
-        utterance_end_ms: 3000,
-      });
+    if (microphoneState === MicrophoneState.Ready && connectionState === LiveConnectionState.CLOSED && !isReconnecting) {
+      console.log('Connecting to Deepgram...');
+      connectToDeepgram(DEEPGRAM_CONFIG);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [microphoneState, isOfflineMode]);
+  }, [microphoneState, connectionState, isReconnecting, connectToDeepgram]);
 
-  // Handle reconnection when coming back online
+  // Handle audio data and transcription events
   useEffect(() => {
-    if (microphoneState === MicrophoneState.Ready && !isOfflineMode && connectionState === LiveConnectionState.CLOSED) {
-      console.log('Reconnecting to Deepgram after coming back online...');
-      connectToDeepgram({
-        model: "nova-3",
-        interim_results: true,
-        smart_format: true,
-        filler_words: true,
-        utterance_end_ms: 3000,
-      });
+    if (!microphone || !connection || connectionState !== LiveConnectionState.OPEN) {
+      return;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOfflineMode, connectionState]);
 
-  // Handle disconnection when going offline
-  useEffect(() => {
-    if (isOfflineMode && connectionState === LiveConnectionState.OPEN) {
-      console.log('Going offline, disconnecting from Deepgram...');
-      disconnectFromDeepgram();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOfflineMode, connectionState]);
-
-  useEffect(() => {
-    if (!microphone) return;
-    if (!connection) return;
-
-    const onData = (e: BlobEvent) => {
-      // iOS SAFARI FIX:
-      // Prevent packetZero from being sent. If sent at size 0, the connection will close. 
-      if (e.data.size > 0) {
-        if (isOfflineMode) {
-          // Store audio segment locally when offline
-          indexedDBService.storeAudioSegment(e.data).then((segmentId) => {
-            indexedDBService.addPendingTranscript(segmentId);
-            setOfflineSegments(prev => prev + 1);
-          });
-        } else {
-          connection?.send(e.data);
-        }
-      }
-    };
-
-    const onTranscript = (data: LiveTranscriptionEvent) => {
-      const { is_final: isFinal, speech_final: speechFinal } = data;
-      let thisCaption = data.channel.alternatives[0].transcript;
-
-      console.log("thisCaption", thisCaption);
-      if (thisCaption !== "") {
-        console.log('thisCaption !== ""', thisCaption);
-        setCaption(thisCaption);
-        
-        // Add to transcription history
-        const newEntry: TranscriptionEntry = {
-          id: `${Date.now()}-${Math.random()}`,
-          text: thisCaption,
-          timestamp: new Date(),
-          isFinal: isFinal || false
-        };
-        
-        setTranscriptions(prev => {
-          // If this is a final result, replace the last interim entry
-          if (isFinal) {
-            const filtered = prev.filter(entry => !entry.isFinal || entry.text !== thisCaption);
-            return [...filtered, newEntry];
-          } else {
-            // For interim results, replace any existing interim entries with the same text
-            const filtered = prev.filter(entry => entry.isFinal || entry.text !== thisCaption);
-            return [...filtered, newEntry];
-          }
-        });
+    const handleAudioData = (e: BlobEvent) => {
+      if (!e.data || e.data.size === 0) {
+        return;
       }
 
-      if (isFinal && speechFinal) {
-        clearTimeout(captionTimeout.current);
-        captionTimeout.current = setTimeout(() => {
-          setCaption(undefined);
-          clearTimeout(captionTimeout.current);
-        }, 3000);
-      }
-    };
-
-    if (connectionState === LiveConnectionState.OPEN) {
-      connection.addListener(LiveTranscriptionEvents.Transcript, onTranscript);
-      microphone.addEventListener(MicrophoneEvents.DataAvailable, onData);
-    }
-
-    return () => {
-      // prettier-ignore
-      connection.removeListener(LiveTranscriptionEvents.Transcript, onTranscript);
-      microphone.removeEventListener(MicrophoneEvents.DataAvailable, onData);
-      clearTimeout(captionTimeout.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionState]);
-
-  useEffect(() => {
-    if (!connection) return;
-
-    if (
-      microphoneState !== MicrophoneState.Open &&
-      connectionState === LiveConnectionState.OPEN
-    ) {
-      connection.keepAlive();
-
-      keepAliveInterval.current = setInterval(() => {
-        connection.keepAlive();
-      }, 10000);
-    } else {
-      clearInterval(keepAliveInterval.current);
-    }
-
-    return () => {
-      clearInterval(keepAliveInterval.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [microphoneState, connectionState]);
-
-  // Handle coming back online - sync offline segments
-  useEffect(() => {
-    if (!isOfflineMode && offlineSegments > 0) {
-      console.log(`Coming back online, processing ${offlineSegments} offline segments...`);
-      offlineTranscriptionService.processPendingTranscripts().then((result) => {
-        if (result.processedCount > 0) {
-          setOfflineSegments(prev => Math.max(0, prev - result.processedCount));
-          // Get only the newly processed transcripts by comparing with existing ones
-          offlineTranscriptionService.getProcessedTranscripts().then((offlineTranscripts) => {
-            console.log('Syncing: Got processed transcripts:', offlineTranscripts.length);
-            setTranscriptions(prev => {
-              // Get existing offline transcript IDs to avoid duplicates
-              const existingOfflineIds = new Set(
-                prev.filter(t => t.isFromOffline).map(t => t.id)
-              );
-              
-              // Filter out transcripts that are already in the state
-              const newTranscripts = offlineTranscripts
-                .filter(offline => !existingOfflineIds.has(offline.id))
-                .map(offline => ({
-                  id: offline.id,
-                  text: offline.text,
-                  timestamp: offline.timestamp,
-                  isFinal: true,
-                  isFromOffline: true
-                }));
-              
-              console.log('Syncing: Adding new transcripts:', newTranscripts.length, newTranscripts);
-              const updatedTranscriptions = [...prev, ...newTranscripts];
-              console.log('Syncing: Total transcriptions after sync:', updatedTranscriptions.length);
-              return updatedTranscriptions;
-            });
-          });
-        }
-      });
-    }
-  }, [isOfflineMode, offlineSegments]);
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      offlineTranscriptionService.cleanup();
-    };
-  }, []);
-
-  // Periodic check to sync offline segments count
-  useEffect(() => {
-    const updateOfflineCount = async () => {
+      console.log("Sending audio data to Deepgram", e.data.size + ' bytes');
+      
       try {
-        const pendingCount = await offlineTranscriptionService.getPendingCount();
-        setOfflineSegments(pendingCount);
+        connection.send(e.data);
       } catch (error) {
-        console.error('Error updating offline count:', error);
+        console.error('Error sending audio data to Deepgram:', error);
       }
     };
 
-    // Update count every 10 seconds
-    const interval = setInterval(updateOfflineCount, 10000);
-    
-    return () => clearInterval(interval);
-  }, []);
+    const handleTranscript = (data: LiveTranscriptionEvent) => {
+      const { is_final: isFinal } = data;
+      const transcript = data.channel.alternatives[0].transcript;
 
-  if (isLoadingOfflineData) {
-    return (
-      <div className="flex h-full items-center justify-center">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-white mx-auto mb-4"></div>
-          <p className="text-white">Loading offline transcriptions...</p>
-        </div>
-      </div>
-    );
-  }
+      if (transcript !== "") {
+        if (isFinal) {
+          // Add final transcript to the list
+          const newEntry: TranscriptionEntry = {
+            id: `${Date.now()}-${Math.random()}`,
+            text: transcript,
+            timestamp: new Date(),
+            isFinal: true
+          };
+          
+          setTranscriptions(prev => [...prev, newEntry]);
+          setCurrentTranscript(""); // Clear current transcript
+        } else {
+          // Update current interim transcript
+          setCurrentTranscript(transcript);
+        }
+      }
+    };
+
+    connection.addListener(LiveTranscriptionEvents.Transcript, handleTranscript);
+    microphone.addEventListener(MicrophoneEvents.DataAvailable, handleAudioData);
+
+    return () => {
+      connection.removeListener(LiveTranscriptionEvents.Transcript, handleTranscript);
+      microphone.removeEventListener(MicrophoneEvents.DataAvailable, handleAudioData);
+    };
+  }, [connection, microphone, connectionState]);
+
+  // Toggle recording
+  const toggleRecording = useCallback(() => {
+    if (microphoneState === MicrophoneState.NotSetup || microphoneState === MicrophoneState.Error) {
+      setupMicrophone();
+      return;
+    }
+
+    if (microphoneState === MicrophoneState.Open) {
+      stopMicrophone();
+    } else if (microphoneState === MicrophoneState.Ready || microphoneState === MicrophoneState.Paused) {
+      startMicrophone();
+    }
+  }, [microphoneState, setupMicrophone, startMicrophone, stopMicrophone]);
+
+  // Get status text
+  const getStatusText = () => {
+    if (isReconnecting) return 'Reconnecting...';
+    
+    if (connectionState === LiveConnectionState.CONNECTING) return 'Connecting...';
+    
+    if (microphoneState === MicrophoneState.NotSetup) return 'Click to setup microphone';
+    
+    if (microphoneState === MicrophoneState.SettingUp) return 'Setting up microphone...';
+    
+    if (microphoneState === MicrophoneState.Error) return 'Microphone error - Click to retry';
+    
+    if (microphoneState === MicrophoneState.Open) return 'Recording... Click to stop';
+    
+    if (connectionState === LiveConnectionState.OPEN && microphoneState === MicrophoneState.Ready) {
+      return 'Ready - Click to start recording';
+    }
+    
+    return 'Preparing...';
+  };
+
+  // Get button style
+  const getButtonStyle = () => {
+    if (microphoneState === MicrophoneState.Open) {
+      return 'bg-red-500 hover:bg-red-600 animate-pulse';
+    }
+    
+    if (microphoneState === MicrophoneState.Error) {
+      return 'bg-yellow-500 hover:bg-yellow-600';
+    }
+    
+    return 'bg-blue-500 hover:bg-blue-600';
+  };
+
+  const isRecording = microphoneState === MicrophoneState.Open;
+  const canRecord = connectionState === LiveConnectionState.OPEN && 
+                   (microphoneState === MicrophoneState.Ready || microphoneState === MicrophoneState.Open);
 
   return (
-    <>
-      <OfflineStatus offlineSegments={offlineSegments} />
-      <OfflineTest />
-      <div className="flex h-full antialiased">
-        <div className="flex flex-row h-full w-full overflow-x-hidden">
-          <div className="flex flex-col flex-auto h-full">
-            {/* height 100% minus 8rem */}
-            <div className="relative w-full h-full">
-              {microphone && <Visualizer microphone={microphone} />}
-              <div className="absolute bottom-[8rem]  inset-x-0 max-w-4xl mx-auto text-center">
-                {caption && <span className="bg-black/70 p-8">{caption}</span>}
-                {isOfflineMode && (
-                  <div className="mt-4">
-                    <span className="bg-yellow-600/80 text-white px-4 py-2 rounded-lg">
-                      🔴 Offline Mode - Recording locally ({offlineSegments} segments)
-                    </span>
-                  </div>
-                )}
-                {!isOfflineMode && offlineSegments > 0 && (
-                  <div className="mt-4">
-                    <span className="bg-green-600/80 text-white px-4 py-2 rounded-lg">
-                      🟢 Syncing {offlineSegments} offline segments...
-                    </span>
-                  </div>
-                )}
-                {!isOfflineMode && offlineSegments === 0 && networkStatus.isOnline && (
-                  <div className="mt-4">
-                    <span className="bg-blue-600/80 text-white px-4 py-2 rounded-lg">
-                      🟢 Online - Connected to Deepgram
-                    </span>
-                  </div>
-                )}
-              </div>
-            </div>
+    <div className="h-full flex flex-col">
+      {/* Header with status */}
+      <div className="p-4 text-center">
+        <div className="mb-4">
+          <div className={`inline-flex items-center px-4 py-2 rounded-lg ${
+            connectionState === LiveConnectionState.OPEN ? 'bg-green-600' : 
+            isReconnecting ? 'bg-yellow-600' : 'bg-red-600'
+          }`}>
+            <div className={`w-2 h-2 rounded-full mr-2 ${
+              connectionState === LiveConnectionState.OPEN ? 'bg-green-300' : 
+              isReconnecting ? 'bg-yellow-300' : 'bg-red-300'
+            }`} />
+            <span className="text-white text-sm">
+              {connectionState === LiveConnectionState.OPEN ? 'Connected' : 
+               isReconnecting ? 'Reconnecting...' : 'Disconnected'}
+            </span>
           </div>
         </div>
       </div>
-      <ChatBar transcriptions={transcriptions} />
-      <MicrophoneControl />
-    </>
+
+      {/* Transcription display */}
+      <div className="flex-1 px-4 pb-32 overflow-hidden">
+        <div className="max-w-4xl mx-auto">
+          <div className="bg-black/20 rounded-lg p-6 max-h-96 overflow-y-auto">
+            <h3 className="text-white text-lg font-medium mb-4">Live Transcription</h3>
+            
+            {transcriptions.length === 0 && !currentTranscript ? (
+              <div className="text-gray-400 text-center py-8">
+                Start speaking to see transcriptions...
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {transcriptions.map((entry) => (
+                  <div key={entry.id} className="flex items-start gap-3">
+                    <span className="text-xs text-gray-500 min-w-[80px] mt-1">
+                      {entry.timestamp.toLocaleTimeString()}
+                    </span>
+                    <p className="text-white text-sm">
+                      {entry.text}
+                    </p>
+                  </div>
+                ))}
+                
+                {/* Current interim transcript */}
+                {currentTranscript && (
+                  <div className="flex items-start gap-3">
+                    <span className="text-xs text-gray-500 min-w-[80px] mt-1">
+                      {new Date().toLocaleTimeString()}
+                    </span>
+                    <p className="text-gray-300 text-sm italic">
+                      {currentTranscript}
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Microphone control */}
+      <div className="fixed bottom-16 left-1/2 transform -translate-x-1/2">
+        <div className="text-center">
+          <button
+            onClick={toggleRecording}
+            className={`
+              relative p-6 rounded-full transition-all duration-300 transform
+              hover:scale-105 active:scale-95 ${getButtonStyle()}
+            `}
+          >
+            {/* Recording pulse effect */}
+            {isRecording && (
+              <div className="absolute inset-0 rounded-full animate-ping bg-red-400 opacity-75" />
+            )}
+            
+            {/* Microphone icon */}
+            <div className="relative z-10">
+              <svg 
+                className="w-8 h-8 text-white" 
+                fill="currentColor" 
+                viewBox="0 0 20 20"
+              >
+                <path 
+                  fillRule="evenodd" 
+                  d="M7 4a3 3 0 016 0v4a3 3 0 11-6 0V4zm4 10.93A7.001 7.001 0 0017 8a1 1 0 10-2 0A5 5 0 015 8a1 1 0 00-2 0 7.001 7.001 0 006 6.93V17H6a1 1 0 100 2h8a1 1 0 100-2h-3v-2.07z" 
+                  clipRule="evenodd" 
+                />
+              </svg>
+            </div>
+          </button>
+
+          {/* Status text */}
+          <div className="mt-4">
+            <p className={`text-sm font-medium ${
+              isRecording ? 'text-red-400' : 
+              microphoneState === MicrophoneState.Error ? 'text-yellow-400' :
+              canRecord ? 'text-blue-400' : 'text-gray-400'
+            }`}>
+              {getStatusText()}
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 };
 

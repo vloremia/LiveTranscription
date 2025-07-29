@@ -1,71 +1,54 @@
-# Next.js Live Transcription Starter
+# Live Transcription
 
-[![Discord](https://dcbadge.vercel.app/api/server/xWRaCDBtW4?style=flat)](https://discord.gg/xWRaCDBtW4)
+## Setup
 
-The purpose of this demo is to showcase how you can build a NextJS speech to text app using [Deepgram](https://deepgram.com/).
-
-## Live Demo
-You can see the demo in action on Vercel: https://nextjs-live-transcription.vercel.app/
-
-## Demo features
-
-Capture streaming audio using [Deepgram Streaming Speech to Text](https://developers.deepgram.com/docs/getting-started-with-live-streaming-audio).
-
-### Offline Mode
-
-This application includes offline functionality that allows you to continue recording audio even when your internet connection is down:
-
-- **Local Storage**: Audio segments are stored locally using IndexedDB when offline
-- **Automatic Sync**: When connection is restored, stored audio segments are automatically transcribed and synced
-- **Visual Indicators**: Clear UI indicators show when you're in offline mode and when syncing is in progress
-- **Retry Logic**: Failed transcriptions are retried with exponential backoff
-- **Data Cleanup**: Old audio segments are automatically cleaned up after 7 days
-
-The offline mode ensures you never lose your audio recordings due to connectivity issues.
-
-## What is Deepgram?
-
-[Deepgram’s](https://deepgram.com/) voice AI platform provides APIs for speech-to-text, text-to-speech, and full speech-to-speech voice agents. Over 200,000+ developers use Deepgram to build voice AI products and features.
-
-## Sign-up to Deepgram
-
-Want to start building using this project? [Sign-up now for Deepgram and create an API key](https://console.deepgram.com/signup?jump=keys).
-
-## Quickstart
-
-### Manual
-
-Follow these steps to get started with this starter application.
-
-#### Clone the repository
-
-Go to GitHub and [clone the repository](https://github.com/deepgram-starters/nextjs-live-transcription).
-
-#### Install dependencies
-
-Install the project dependencies.
-
+### 1. Install Dependencies
 ```bash
 npm install
+# or
+yarn install
 ```
 
-#### Edit the config file
-
-Copy the code from `sample.env.local` and create a new file called `.env.local`.
-
+### 2. Configure Deepgram API Key
+1. Sign up for a free account at [Deepgram Console](https://console.deepgram.com/)
+2. Create a new API key with "Member" scope or higher
+3. Copy the API key
+4. Create a `.env.local` file in the root directory:
 ```bash
-DEEPGRAM_API_KEY=YOUR-DG-API-KEY
+DEEPGRAM_API_KEY=your_actual_deepgram_api_key_here
+DEEPGRAM_ENV=development
 ```
 
-For `DEEPGRAM_API_KEY` paste in the key you generated in the [Deepgram console](https://console.deepgram.com/).
+⚠️ **Important**: Replace `your_actual_deepgram_api_key_here` with your actual Deepgram API key. The application will not work without a valid API key.
 
-#### Run the application
-
-Once running, you can [access the application in your browser](http://localhost:3000).
-
+### 3. Run the Development Server
 ```bash
 npm run dev
+# or
+yarn dev
 ```
+
+## Troubleshooting
+
+### WebSocket Connection Errors
+If you see "WebSocket connection error" in the console:
+
+1. **Check API Key**: Ensure your `DEEPGRAM_API_KEY` is correctly set in `.env.local`
+2. **Verify API Key Scope**: Make sure your API key has "Member" scope or higher
+3. **Check Network**: Ensure you have a stable internet connection
+4. **Browser Permissions**: Allow microphone access when prompted
+
+### Common Error Messages
+- `Authentication failed`: Check your API key configuration
+- `API quota exceeded`: You've reached your Deepgram usage limit
+- `Connection timeout`: Network connectivity issues
+
+## Features
+
+- Real-time speech-to-text transcription
+- Offline mode with local audio storage
+- Automatic reconnection on network issues
+- Visual feedback for connection status
 
 ## Issue Reporting
 

@@ -13,19 +13,18 @@ import React, {
   createContext,
   useContext,
   useState,
+  useRef,
+  useCallback,
   ReactNode,
   FunctionComponent,
 } from "react";
-import { networkService, NetworkStatus } from "../services/NetworkService";
-import { indexedDBService } from "../services/IndexedDBService";
 
 interface DeepgramContextType {
   connection: LiveClient | null;
-  connectToDeepgram: (options: LiveSchema, endpoint?: string) => Promise<void>;
+  connectToDeepgram: (options: LiveSchema) => Promise<void>;
   disconnectFromDeepgram: () => void;
   connectionState: LiveConnectionState;
-  isOfflineMode: boolean;
-  networkStatus: NetworkStatus;
+  isReconnecting: boolean;
 }
 
 const DeepgramContext = createContext<DeepgramContextType | undefined>(
@@ -37,9 +36,28 @@ interface DeepgramContextProviderProps {
 }
 
 const getToken = async (): Promise<string> => {
-  const response = await fetch("/api/authenticate", { cache: "no-store" });
-  const result = await response.json();
-  return result.access_token;
+  try {
+    console.log("Requesting Deepgram authentication token...");
+    const response = await fetch("/api/authenticate", { cache: "no-store" });
+    
+    if (!response.ok) {
+      throw new Error(`Authentication failed: ${response.status}`);
+    }
+    
+    const result = await response.json();
+    console.log("Authentication response received");
+    
+    if (result.access_token) return result.access_token;
+    if (result.key) return result.key;
+    if (result.error) {
+      throw new Error(`Authentication error: ${result.error}`);
+    }
+    
+    throw new Error("Unexpected authentication response format");
+  } catch (error) {
+    console.error("Authentication failed:", error);
+    throw error instanceof Error ? error : new Error(String(error));
+  }
 };
 
 const DeepgramContextProvider: FunctionComponent<
@@ -49,53 +67,153 @@ const DeepgramContextProvider: FunctionComponent<
   const [connectionState, setConnectionState] = useState<LiveConnectionState>(
     LiveConnectionState.CLOSED
   );
-  const [networkStatus, setNetworkStatus] = useState<NetworkStatus>(networkService.getStatus());
-  const [isOfflineMode, setIsOfflineMode] = useState<boolean>(!networkStatus.isOnline);
+  const [isReconnecting, setIsReconnecting] = useState<boolean>(false);
 
-  // Listen for network status changes
-  React.useEffect(() => {
-    const handleNetworkChange = (status: NetworkStatus) => {
-      setNetworkStatus(status);
-      setIsOfflineMode(!status.isOnline);
-    };
+  // Store connection options for reconnection
+  const connectionOptionsRef = useRef<LiveSchema | null>(null);
+  const reconnectionTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-    networkService.addListener(handleNetworkChange);
-    return () => networkService.removeListener(handleNetworkChange);
-  }, []);
+  const attemptReconnection = useCallback(async (): Promise<void> => {
+    if (isReconnecting || !connectionOptionsRef.current) {
+      return;
+    }
 
-  /**
-   * Connects to the Deepgram speech recognition service and sets up a live transcription session.
-   *
-   * @param options - The configuration options for the live transcription session.
-   * @param endpoint - The optional endpoint URL for the Deepgram service.
-   * @returns A Promise that resolves when the connection is established.
-   */
-  const connectToDeepgram = async (options: LiveSchema, endpoint?: string) => {
-    const token = await getToken();
-    const deepgram = createClient({ accessToken: token });
+    setIsReconnecting(true);
+    console.log("Attempting to reconnect to Deepgram...");
 
-    const conn = deepgram.listen.live(options, endpoint);
+    // Wait 2 seconds before attempting reconnection
+    await new Promise(resolve => setTimeout(resolve, 2000));
 
-    // Set connecting state immediately
+    try {
+      await performConnection(connectionOptionsRef.current);
+      console.log("Reconnection successful");
+    } catch (error) {
+      console.error("Reconnection failed:", error);
+      // Try again after 5 seconds
+      reconnectionTimeoutRef.current = setTimeout(() => {
+        attemptReconnection();
+      }, 5000);
+    } finally {
+      setIsReconnecting(false);
+    }
+  }, [isReconnecting]);
+
+  const performConnection = useCallback(async (options: LiveSchema): Promise<void> => {
+    console.log("Connecting to Deepgram...");
     setConnectionState(LiveConnectionState.CONNECTING);
+    
+    try {
+      const token = await getToken();
+      const deepgram = createClient({ accessToken: token });
+      const conn = deepgram.listen.live(options);
+      
+      return new Promise((resolve, reject) => {
+        const connectionTimeout = setTimeout(() => {
+          console.error("Connection timeout after 10 seconds");
+          reject(new Error("Connection timeout"));
+        }, 10000);
 
-    conn.addListener(LiveTranscriptionEvents.Open, () => {
-      setConnectionState(LiveConnectionState.OPEN);
-    });
+        const cleanup = () => {
+          clearTimeout(connectionTimeout);
+        };
 
-    conn.addListener(LiveTranscriptionEvents.Close, () => {
+        setConnection(conn);
+
+        conn.addListener(LiveTranscriptionEvents.Open, () => {
+          cleanup();
+          setConnectionState(LiveConnectionState.OPEN);
+          console.log("Deepgram connection established successfully");
+          resolve();
+        });
+
+        conn.addListener(LiveTranscriptionEvents.Close, (event) => {
+          cleanup();
+          console.log("Deepgram connection closed:", event?.code, event?.reason);
+          setConnectionState(LiveConnectionState.CLOSED);
+          
+          // Attempt reconnection if this wasn't an expected closure
+          if (connectionOptionsRef.current) {
+            attemptReconnection();
+          }
+          
+          reject(new Error(`Connection closed: ${event?.code} ${event?.reason || 'No reason provided'}`));
+        });
+
+        conn.addListener(LiveTranscriptionEvents.Error, (error) => {
+          cleanup();
+          console.error("Deepgram connection error:", error);
+          setConnectionState(LiveConnectionState.CLOSED);
+          
+          // Attempt reconnection on error
+          if (connectionOptionsRef.current) {
+            attemptReconnection();
+          }
+          
+          reject(error instanceof Error ? error : new Error(String(error)));
+        });
+
+        conn.addListener(LiveTranscriptionEvents.Metadata, (metadata) => {
+          console.log("Deepgram metadata received:", metadata);
+        });
+      });
+    } catch (error) {
+      console.error("Error during connection setup:", error);
       setConnectionState(LiveConnectionState.CLOSED);
-    });
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+  }, [attemptReconnection]);
 
-    setConnection(conn);
-  };
+  const connectToDeepgram = useCallback(async (options: LiveSchema) => {
+    // Store options for reconnection
+    connectionOptionsRef.current = options;
 
-  const disconnectFromDeepgram = async () => {
+    // Clear any existing reconnection timeout
+    if (reconnectionTimeoutRef.current) {
+      clearTimeout(reconnectionTimeoutRef.current);
+      reconnectionTimeoutRef.current = null;
+    }
+
+    try {
+      await performConnection(options);
+    } catch (error) {
+      console.error("Initial connection failed:", error);
+      // Attempt reconnection
+      attemptReconnection();
+    }
+  }, [performConnection, attemptReconnection]);
+
+  const disconnectFromDeepgram = useCallback(() => {
+    console.log("Disconnecting from Deepgram...");
+    
+    // Clear reconnection timeout and options to prevent automatic reconnection
+    if (reconnectionTimeoutRef.current) {
+      clearTimeout(reconnectionTimeoutRef.current);
+      reconnectionTimeoutRef.current = null;
+    }
+    connectionOptionsRef.current = null;
+
+    // Close connection
     if (connection) {
-      connection.finish();
+      try {
+        connection.finish();
+      } catch (error) {
+        console.error("Error finishing connection:", error);
+      }
       setConnection(null);
     }
-  };
+    
+    setConnectionState(LiveConnectionState.CLOSED);
+    setIsReconnecting(false);
+  }, [connection]);
+
+  // Cleanup on unmount
+  React.useEffect(() => {
+    return () => {
+      if (reconnectionTimeoutRef.current) {
+        clearTimeout(reconnectionTimeoutRef.current);
+      }
+    };
+  }, []);
 
   return (
     <DeepgramContext.Provider
@@ -104,8 +222,7 @@ const DeepgramContextProvider: FunctionComponent<
         connectToDeepgram,
         disconnectFromDeepgram,
         connectionState,
-        isOfflineMode,
-        networkStatus,
+        isReconnecting,
       }}
     >
       {children}
