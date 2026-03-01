@@ -23,7 +23,6 @@ export const viewport: Viewport = {
 };
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://nextjs-live-transcription.vercel.app"),
   title: "Live Transcription",
   description:
     "Real-time speech transcription with Deepgram, including offline capture and sync support.",
