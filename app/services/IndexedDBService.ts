@@ -18,6 +18,21 @@ class IndexedDBService {
   private version = 2; // Increment version to trigger migration
   private db: IDBDatabase | null = null;
 
+  private createId(): string {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+    return `${Date.now()}-${Math.random()}`;
+  }
+
+  private waitForTransaction(transaction: IDBTransaction): Promise<void> {
+    return new Promise((resolve, reject) => {
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error ?? new Error('IndexedDB transaction aborted'));
+    });
+  }
+
   async init(): Promise<void> {
     return new Promise((resolve, reject) => {
       const request = indexedDB.open(this.dbName, this.version);
@@ -92,7 +107,7 @@ class IndexedDBService {
       const store = transaction.objectStore('audioSegments');
       
       const segment: AudioSegment = {
-        id: `${Date.now()}-${Math.random()}`,
+        id: this.createId(),
         audioBlob,
         timestamp: new Date(),
         isProcessed: false
@@ -244,7 +259,7 @@ class IndexedDBService {
       const store = transaction.objectStore('pendingTranscripts');
       
       const pending: PendingTranscript = {
-        id: `${Date.now()}-${Math.random()}`,
+        id: this.createId(),
         audioSegmentId,
         timestamp: new Date(),
         retryCount: 0
@@ -311,34 +326,31 @@ class IndexedDBService {
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - daysToKeep);
 
-    // Clear old audio segments
-    const audioTransaction = this.db!.transaction(['audioSegments'], 'readwrite');
-    const audioStore = audioTransaction.objectStore('audioSegments');
-    const audioIndex = audioStore.index('timestamp');
-    const audioRequest = audioIndex.openCursor(IDBKeyRange.upperBound(cutoffDate));
+    const clearStore = (storeName: 'audioSegments' | 'pendingTranscripts') => {
+      return new Promise<void>((resolve, reject) => {
+        const transaction = this.db!.transaction([storeName], 'readwrite');
+        const store = transaction.objectStore(storeName);
+        const index = store.index('timestamp');
+        const request = index.openCursor(IDBKeyRange.upperBound(cutoffDate));
 
-    audioRequest.onsuccess = () => {
-      const cursor = audioRequest.result;
-      if (cursor) {
-        audioStore.delete(cursor.primaryKey);
-        cursor.continue();
-      }
+        request.onsuccess = () => {
+          const cursor = request.result;
+          if (cursor) {
+            store.delete(cursor.primaryKey);
+            cursor.continue();
+          }
+        };
+        request.onerror = () => reject(request.error);
+
+        this.waitForTransaction(transaction).then(resolve).catch(reject);
+      });
     };
 
-    // Clear old pending transcripts
-    const pendingTransaction = this.db!.transaction(['pendingTranscripts'], 'readwrite');
-    const pendingStore = pendingTransaction.objectStore('pendingTranscripts');
-    const pendingIndex = pendingStore.index('timestamp');
-    const pendingRequest = pendingIndex.openCursor(IDBKeyRange.upperBound(cutoffDate));
-
-    pendingRequest.onsuccess = () => {
-      const cursor = pendingRequest.result;
-      if (cursor) {
-        pendingStore.delete(cursor.primaryKey);
-        cursor.continue();
-      }
-    };
+    await Promise.all([
+      clearStore('audioSegments'),
+      clearStore('pendingTranscripts')
+    ]);
   }
 }
 
-export const indexedDBService = new IndexedDBService(); 
+export const indexedDBService = new IndexedDBService();

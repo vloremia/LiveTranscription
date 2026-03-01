@@ -84,16 +84,21 @@ class NetworkService implements INetworkService {
   }
 
   async checkConnectivity(): Promise<boolean> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
     try {
       // Try to fetch a small resource to test connectivity
       const response = await fetch('/api/authenticate', { 
         method: 'HEAD',
         cache: 'no-store',
-        signal: AbortSignal.timeout(5000) // 5 second timeout
+        signal: controller.signal
       });
       this.isOnline = response.ok;
     } catch (error) {
       this.isOnline = false;
+    } finally {
+      clearTimeout(timeout);
     }
     
     this.notifyListeners();
@@ -127,4 +132,4 @@ export const networkService: INetworkService = (() => {
       setOfflineMode: () => {}
     };
   }
-})(); 
+})();

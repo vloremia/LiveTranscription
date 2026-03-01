@@ -14,11 +14,11 @@ import {
 } from "../context/MicrophoneContextProvider";
 import { indexedDBService } from "../services/IndexedDBService";
 import { offlineTranscriptionService } from "../services/OfflineTranscriptionService";
-import Visualizer from "./Visualizer";
 import ChatBar from "./ChatBar";
 import MicrophoneControl from "./MicrophoneControl";
 import OfflineStatus from "./OfflineStatus";
 import OfflineTest from "./OfflineTest";
+import Visualizer from "./Visualizer";
 
 interface TranscriptionEntry {
   id: string;
@@ -28,6 +28,66 @@ interface TranscriptionEntry {
   isFromOffline?: boolean;
 }
 
+const MAX_TRANSCRIPTIONS = 300;
+const OFFLINE_COUNT_REFRESH_MS = 10000;
+const CAPTION_CLEAR_DELAY_MS = 3000;
+const KEEP_ALIVE_INTERVAL_MS = 10000;
+
+const LIVE_CONNECTION_OPTIONS = {
+  model: "nova-3",
+  interim_results: true,
+  smart_format: true,
+  filler_words: true,
+  utterance_end_ms: 3000,
+};
+
+const createEntryId = () => {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random()}`;
+};
+
+const normalizeTimestamp = (value: Date | string): Date =>
+  value instanceof Date ? value : new Date(value);
+
+const sortAndLimitTranscriptions = (
+  entries: TranscriptionEntry[]
+): TranscriptionEntry[] =>
+  [...entries]
+    .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
+    .slice(-MAX_TRANSCRIPTIONS);
+
+const mapOfflineEntries = (
+  offlineTranscripts: Array<{ id: string; text: string; timestamp: Date | string }>
+): TranscriptionEntry[] =>
+  offlineTranscripts.map((offline) => ({
+    id: offline.id,
+    text: offline.text,
+    timestamp: normalizeTimestamp(offline.timestamp),
+    isFinal: true,
+    isFromOffline: true,
+  }));
+
+const mergeOfflineTranscriptions = (
+  previous: TranscriptionEntry[],
+  incomingOfflineEntries: TranscriptionEntry[]
+): TranscriptionEntry[] => {
+  const existingOfflineIds = new Set(
+    previous.filter((entry) => entry.isFromOffline).map((entry) => entry.id)
+  );
+
+  const newEntries = incomingOfflineEntries.filter(
+    (entry) => !existingOfflineIds.has(entry.id)
+  );
+
+  if (newEntries.length === 0) {
+    return previous;
+  }
+
+  return sortAndLimitTranscriptions([...previous, ...newEntries]);
+};
+
 const App: () => JSX.Element = () => {
   const [caption, setCaption] = useState<string | undefined>(
     "Powered by Deepgram"
@@ -35,168 +95,195 @@ const App: () => JSX.Element = () => {
   const [transcriptions, setTranscriptions] = useState<TranscriptionEntry[]>([]);
   const [offlineSegments, setOfflineSegments] = useState<number>(0);
   const [isLoadingOfflineData, setIsLoadingOfflineData] = useState<boolean>(true);
-  const { connection, connectToDeepgram, connectionState, isOfflineMode, networkStatus, disconnectFromDeepgram } = useDeepgram();
-  const { setupMicrophone, microphone, startMicrophone, microphoneState } =
-    useMicrophone();
-  const captionTimeout = useRef<any>();
-  const keepAliveInterval = useRef<any>();
+  const {
+    connection,
+    connectToDeepgram,
+    connectionState,
+    isOfflineMode,
+    networkStatus,
+    disconnectFromDeepgram,
+  } = useDeepgram();
+  const { setupMicrophone, microphone, microphoneState } = useMicrophone();
+  const captionTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const keepAliveInterval = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Load offline transcriptions on mount
   useEffect(() => {
     const loadOfflineData = async () => {
       try {
         await indexedDBService.init();
-        offlineTranscriptionService.startAutoSync();
-        
-        // Load existing offline transcriptions
-        const offlineTranscripts = await offlineTranscriptionService.getProcessedTranscripts();
-        console.log('Loaded offline transcripts:', offlineTranscripts.length, offlineTranscripts);
-        
-        const offlineEntries = offlineTranscripts.map(offline => ({
-          id: offline.id,
-          text: offline.text,
-          timestamp: offline.timestamp,
-          isFinal: true,
-          isFromOffline: true
-        }));
-        
-        setTranscriptions(prev => {
-          const newTranscriptions = [...prev, ...offlineEntries];
-          console.log('Updated transcriptions with offline data:', newTranscriptions.length, 'total entries');
-          return newTranscriptions;
-        });
-        
-        // Get count of pending segments
+        await offlineTranscriptionService.startAutoSync();
+
+        const offlineTranscripts =
+          await offlineTranscriptionService.getProcessedTranscripts();
+        setTranscriptions((prev) =>
+          mergeOfflineTranscriptions(prev, mapOfflineEntries(offlineTranscripts))
+        );
+
         const pendingCount = await offlineTranscriptionService.getPendingCount();
         setOfflineSegments(pendingCount);
-        console.log('Pending segments count:', pendingCount);
       } catch (error) {
-        console.error('Error loading offline data:', error);
+        console.error("Error loading offline data:", error);
       } finally {
         setIsLoadingOfflineData(false);
       }
     };
 
-    loadOfflineData();
+    void loadOfflineData();
   }, []);
 
   useEffect(() => {
-    setupMicrophone();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    void setupMicrophone();
+  }, [setupMicrophone]);
 
   useEffect(() => {
-    if (microphoneState === MicrophoneState.Ready && !isOfflineMode) {
-      connectToDeepgram({
-        model: "nova-3",
-        interim_results: true,
-        smart_format: true,
-        filler_words: true,
-        utterance_end_ms: 3000,
-      });
+    if (microphoneState !== MicrophoneState.Ready || isOfflineMode) {
+      return;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [microphoneState, isOfflineMode]);
 
-  // Handle reconnection when coming back online
-  useEffect(() => {
-    if (microphoneState === MicrophoneState.Ready && !isOfflineMode && connectionState === LiveConnectionState.CLOSED) {
-      console.log('Reconnecting to Deepgram after coming back online...');
-      connectToDeepgram({
-        model: "nova-3",
-        interim_results: true,
-        smart_format: true,
-        filler_words: true,
-        utterance_end_ms: 3000,
-      });
+    if (
+      connectionState === LiveConnectionState.OPEN ||
+      connectionState === LiveConnectionState.CONNECTING
+    ) {
+      return;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOfflineMode, connectionState]);
 
-  // Handle disconnection when going offline
+    void connectToDeepgram(LIVE_CONNECTION_OPTIONS);
+  }, [microphoneState, isOfflineMode, connectionState, connectToDeepgram]);
+
   useEffect(() => {
-    if (isOfflineMode && connectionState === LiveConnectionState.OPEN) {
-      console.log('Going offline, disconnecting from Deepgram...');
-      disconnectFromDeepgram();
+    if (
+      isOfflineMode &&
+      (connectionState === LiveConnectionState.OPEN ||
+        connectionState === LiveConnectionState.CONNECTING)
+    ) {
+      void disconnectFromDeepgram();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOfflineMode, connectionState]);
+  }, [isOfflineMode, connectionState, disconnectFromDeepgram]);
 
   useEffect(() => {
-    if (!microphone) return;
-    if (!connection) return;
+    if (!microphone) {
+      return;
+    }
 
-    const onData = (e: BlobEvent) => {
-      // iOS SAFARI FIX:
-      // Prevent packetZero from being sent. If sent at size 0, the connection will close. 
-      if (e.data.size > 0) {
-        if (isOfflineMode) {
-          // Store audio segment locally when offline
-          indexedDBService.storeAudioSegment(e.data).then((segmentId) => {
-            indexedDBService.addPendingTranscript(segmentId);
-            setOfflineSegments(prev => prev + 1);
-          });
-        } else {
-          connection?.send(e.data);
-        }
+    const onData = async (e: BlobEvent) => {
+      // iOS Safari fix: avoid sending packetZero because it can close the stream.
+      if (e.data.size <= 0) {
+        return;
       }
+
+      const shouldStoreOffline =
+        isOfflineMode ||
+        connectionState !== LiveConnectionState.OPEN ||
+        !connection;
+
+      if (shouldStoreOffline) {
+        try {
+          const segmentId = await indexedDBService.storeAudioSegment(e.data);
+          await indexedDBService.addPendingTranscript(segmentId);
+          setOfflineSegments((prev) => prev + 1);
+        } catch (error) {
+          console.error("Failed to store offline audio segment:", error);
+        }
+        return;
+      }
+
+      connection.send(e.data);
     };
+
+    microphone.addEventListener(MicrophoneEvents.DataAvailable, onData);
+    return () => {
+      microphone.removeEventListener(MicrophoneEvents.DataAvailable, onData);
+    };
+  }, [microphone, connection, connectionState, isOfflineMode]);
+
+  useEffect(() => {
+    if (!connection || connectionState !== LiveConnectionState.OPEN) {
+      return;
+    }
 
     const onTranscript = (data: LiveTranscriptionEvent) => {
       const { is_final: isFinal, speech_final: speechFinal } = data;
-      let thisCaption = data.channel.alternatives[0].transcript;
+      const thisCaption = data.channel.alternatives?.[0]?.transcript?.trim() ?? "";
 
-      console.log("thisCaption", thisCaption);
-      if (thisCaption !== "") {
-        console.log('thisCaption !== ""', thisCaption);
-        setCaption(thisCaption);
-        
-        // Add to transcription history
-        const newEntry: TranscriptionEntry = {
-          id: `${Date.now()}-${Math.random()}`,
-          text: thisCaption,
-          timestamp: new Date(),
-          isFinal: isFinal || false
-        };
-        
-        setTranscriptions(prev => {
-          // If this is a final result, replace the last interim entry
-          if (isFinal) {
-            const filtered = prev.filter(entry => !entry.isFinal || entry.text !== thisCaption);
-            return [...filtered, newEntry];
-          } else {
-            // For interim results, replace any existing interim entries with the same text
-            const filtered = prev.filter(entry => entry.isFinal || entry.text !== thisCaption);
-            return [...filtered, newEntry];
-          }
-        });
+      if (!thisCaption) {
+        return;
       }
+
+      setCaption(thisCaption);
+
+      const now = new Date();
+      setTranscriptions((prev) => {
+        const next = [...prev];
+        const lastIndex = next.length - 1;
+        const lastEntry = next[lastIndex];
+
+        if (isFinal) {
+          const newEntry: TranscriptionEntry = {
+            id: createEntryId(),
+            text: thisCaption,
+            timestamp: now,
+            isFinal: true,
+          };
+
+          if (lastEntry && !lastEntry.isFinal && !lastEntry.isFromOffline) {
+            next[lastIndex] = newEntry;
+          } else if (
+            !(
+              lastEntry &&
+              lastEntry.isFinal &&
+              !lastEntry.isFromOffline &&
+              lastEntry.text === thisCaption
+            )
+          ) {
+            next.push(newEntry);
+          }
+        } else if (lastEntry && !lastEntry.isFinal && !lastEntry.isFromOffline) {
+          next[lastIndex] = {
+            ...lastEntry,
+            text: thisCaption,
+            timestamp: now,
+          };
+        } else {
+          next.push({
+            id: createEntryId(),
+            text: thisCaption,
+            timestamp: now,
+            isFinal: false,
+          });
+        }
+
+        return sortAndLimitTranscriptions(next);
+      });
 
       if (isFinal && speechFinal) {
-        clearTimeout(captionTimeout.current);
+        if (captionTimeout.current) {
+          clearTimeout(captionTimeout.current);
+        }
+
         captionTimeout.current = setTimeout(() => {
           setCaption(undefined);
-          clearTimeout(captionTimeout.current);
-        }, 3000);
+          if (captionTimeout.current) {
+            clearTimeout(captionTimeout.current);
+            captionTimeout.current = null;
+          }
+        }, CAPTION_CLEAR_DELAY_MS);
       }
     };
 
-    if (connectionState === LiveConnectionState.OPEN) {
-      connection.addListener(LiveTranscriptionEvents.Transcript, onTranscript);
-      microphone.addEventListener(MicrophoneEvents.DataAvailable, onData);
-    }
+    connection.addListener(LiveTranscriptionEvents.Transcript, onTranscript);
 
     return () => {
-      // prettier-ignore
       connection.removeListener(LiveTranscriptionEvents.Transcript, onTranscript);
-      microphone.removeEventListener(MicrophoneEvents.DataAvailable, onData);
-      clearTimeout(captionTimeout.current);
+      if (captionTimeout.current) {
+        clearTimeout(captionTimeout.current);
+      }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionState]);
+  }, [connection, connectionState]);
 
   useEffect(() => {
-    if (!connection) return;
+    if (!connection) {
+      return;
+    }
 
     if (
       microphoneState !== MicrophoneState.Open &&
@@ -206,76 +293,88 @@ const App: () => JSX.Element = () => {
 
       keepAliveInterval.current = setInterval(() => {
         connection.keepAlive();
-      }, 10000);
-    } else {
+      }, KEEP_ALIVE_INTERVAL_MS);
+    } else if (keepAliveInterval.current) {
       clearInterval(keepAliveInterval.current);
+      keepAliveInterval.current = null;
     }
 
     return () => {
-      clearInterval(keepAliveInterval.current);
+      if (keepAliveInterval.current) {
+        clearInterval(keepAliveInterval.current);
+        keepAliveInterval.current = null;
+      }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [microphoneState, connectionState]);
+  }, [microphoneState, connectionState, connection]);
 
-  // Handle coming back online - sync offline segments
   useEffect(() => {
-    if (!isOfflineMode && offlineSegments > 0) {
-      console.log(`Coming back online, processing ${offlineSegments} offline segments...`);
-      offlineTranscriptionService.processPendingTranscripts().then((result) => {
-        if (result.processedCount > 0) {
-          setOfflineSegments(prev => Math.max(0, prev - result.processedCount));
-          // Get only the newly processed transcripts by comparing with existing ones
-          offlineTranscriptionService.getProcessedTranscripts().then((offlineTranscripts) => {
-            console.log('Syncing: Got processed transcripts:', offlineTranscripts.length);
-            setTranscriptions(prev => {
-              // Get existing offline transcript IDs to avoid duplicates
-              const existingOfflineIds = new Set(
-                prev.filter(t => t.isFromOffline).map(t => t.id)
-              );
-              
-              // Filter out transcripts that are already in the state
-              const newTranscripts = offlineTranscripts
-                .filter(offline => !existingOfflineIds.has(offline.id))
-                .map(offline => ({
-                  id: offline.id,
-                  text: offline.text,
-                  timestamp: offline.timestamp,
-                  isFinal: true,
-                  isFromOffline: true
-                }));
-              
-              console.log('Syncing: Adding new transcripts:', newTranscripts.length, newTranscripts);
-              const updatedTranscriptions = [...prev, ...newTranscripts];
-              console.log('Syncing: Total transcriptions after sync:', updatedTranscriptions.length);
-              return updatedTranscriptions;
-            });
-          });
-        }
-      });
+    if (isOfflineMode || offlineSegments <= 0) {
+      return;
     }
+
+    let isCancelled = false;
+
+    const syncOfflineSegments = async () => {
+      try {
+        const result = await offlineTranscriptionService.processPendingTranscripts();
+        if (isCancelled) {
+          return;
+        }
+
+        const [pendingCount, offlineTranscripts] = await Promise.all([
+          offlineTranscriptionService.getPendingCount(),
+          offlineTranscriptionService.getProcessedTranscripts(),
+        ]);
+
+        if (isCancelled) {
+          return;
+        }
+
+        setOfflineSegments(pendingCount);
+        setTranscriptions((prev) =>
+          mergeOfflineTranscriptions(prev, mapOfflineEntries(offlineTranscripts))
+        );
+
+        if (!result.success && result.errors.length > 0) {
+          console.error("Offline sync completed with errors:", result.errors);
+        }
+      } catch (error) {
+        if (!isCancelled) {
+          console.error("Failed to sync offline transcripts:", error);
+        }
+      }
+    };
+
+    void syncOfflineSegments();
+
+    return () => {
+      isCancelled = true;
+    };
   }, [isOfflineMode, offlineSegments]);
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => {
-      offlineTranscriptionService.cleanup();
+      offlineTranscriptionService.stopAutoSync();
+      if (captionTimeout.current) {
+        clearTimeout(captionTimeout.current);
+      }
+      if (keepAliveInterval.current) {
+        clearInterval(keepAliveInterval.current);
+      }
     };
   }, []);
 
-  // Periodic check to sync offline segments count
   useEffect(() => {
     const updateOfflineCount = async () => {
       try {
         const pendingCount = await offlineTranscriptionService.getPendingCount();
         setOfflineSegments(pendingCount);
       } catch (error) {
-        console.error('Error updating offline count:', error);
+        console.error("Error updating offline count:", error);
       }
     };
 
-    // Update count every 10 seconds
-    const interval = setInterval(updateOfflineCount, 10000);
-    
+    const interval = setInterval(updateOfflineCount, OFFLINE_COUNT_REFRESH_MS);
     return () => clearInterval(interval);
   }, []);
 
@@ -283,7 +382,7 @@ const App: () => JSX.Element = () => {
     return (
       <div className="flex h-full items-center justify-center">
         <div className="text-center">
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-white mx-auto mb-4"></div>
+          <div className="mx-auto mb-4 h-8 w-8 animate-spin rounded-full border-b-2 border-white"></div>
           <p className="text-white">Loading offline transcriptions...</p>
         </div>
       </div>
@@ -293,32 +392,31 @@ const App: () => JSX.Element = () => {
   return (
     <>
       <OfflineStatus offlineSegments={offlineSegments} />
-      <OfflineTest />
+      {process.env.NODE_ENV === "development" && <OfflineTest />}
       <div className="flex h-full antialiased">
-        <div className="flex flex-row h-full w-full overflow-x-hidden">
-          <div className="flex flex-col flex-auto h-full">
-            {/* height 100% minus 8rem */}
-            <div className="relative w-full h-full">
+        <div className="flex h-full w-full flex-row overflow-x-hidden">
+          <div className="flex h-full flex-auto flex-col">
+            <div className="relative h-full w-full">
               {microphone && <Visualizer microphone={microphone} />}
-              <div className="absolute bottom-[8rem]  inset-x-0 max-w-4xl mx-auto text-center">
+              <div className="absolute inset-x-0 bottom-[8rem] mx-auto max-w-4xl text-center">
                 {caption && <span className="bg-black/70 p-8">{caption}</span>}
                 {isOfflineMode && (
                   <div className="mt-4">
-                    <span className="bg-yellow-600/80 text-white px-4 py-2 rounded-lg">
+                    <span className="rounded-lg bg-yellow-600/80 px-4 py-2 text-white">
                       🔴 Offline Mode - Recording locally ({offlineSegments} segments)
                     </span>
                   </div>
                 )}
                 {!isOfflineMode && offlineSegments > 0 && (
                   <div className="mt-4">
-                    <span className="bg-green-600/80 text-white px-4 py-2 rounded-lg">
+                    <span className="rounded-lg bg-green-600/80 px-4 py-2 text-white">
                       🟢 Syncing {offlineSegments} offline segments...
                     </span>
                   </div>
                 )}
                 {!isOfflineMode && offlineSegments === 0 && networkStatus.isOnline && (
                   <div className="mt-4">
-                    <span className="bg-blue-600/80 text-white px-4 py-2 rounded-lg">
+                    <span className="rounded-lg bg-blue-600/80 px-4 py-2 text-white">
                       🟢 Online - Connected to Deepgram
                     </span>
                   </div>

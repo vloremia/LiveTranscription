@@ -3,6 +3,18 @@ import { NextResponse, type NextRequest } from "next/server";
 
 export const revalidate = 0;
 
+export async function HEAD() {
+  const response = new NextResponse(null, { status: 200 });
+  response.headers.set("Surrogate-Control", "no-store");
+  response.headers.set(
+    "Cache-Control",
+    "s-maxage=0, no-store, no-cache, must-revalidate, proxy-revalidate"
+  );
+  response.headers.set("Expires", "0");
+
+  return response;
+}
+
 export async function GET(request: NextRequest) {
   // exit early so we don't request 70000000 keys while in devmode
   if (process.env.DEEPGRAM_ENV === "development") {

@@ -9,20 +9,21 @@ import {
   type LiveTranscriptionEvent,
 } from "@deepgram/sdk";
 
-import React, {
+import {
   createContext,
+  useCallback,
   useContext,
+  useEffect,
+  useRef,
   useState,
   ReactNode,
-  FunctionComponent,
 } from "react";
 import { networkService, NetworkStatus } from "../services/NetworkService";
-import { indexedDBService } from "../services/IndexedDBService";
 
 interface DeepgramContextType {
   connection: LiveClient | null;
   connectToDeepgram: (options: LiveSchema, endpoint?: string) => Promise<void>;
-  disconnectFromDeepgram: () => void;
+  disconnectFromDeepgram: () => Promise<void>;
   connectionState: LiveConnectionState;
   isOfflineMode: boolean;
   networkStatus: NetworkStatus;
@@ -38,22 +39,29 @@ interface DeepgramContextProviderProps {
 
 const getToken = async (): Promise<string> => {
   const response = await fetch("/api/authenticate", { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`Failed to authenticate with Deepgram: ${response.status}`);
+  }
   const result = await response.json();
+  if (!result.access_token) {
+    throw new Error("Missing Deepgram access token");
+  }
   return result.access_token;
 };
 
-const DeepgramContextProvider: FunctionComponent<
-  DeepgramContextProviderProps
-> = ({ children }) => {
+const DeepgramContextProvider = ({ children }: DeepgramContextProviderProps) => {
   const [connection, setConnection] = useState<LiveClient | null>(null);
   const [connectionState, setConnectionState] = useState<LiveConnectionState>(
     LiveConnectionState.CLOSED
   );
-  const [networkStatus, setNetworkStatus] = useState<NetworkStatus>(networkService.getStatus());
+  const [networkStatus, setNetworkStatus] = useState<NetworkStatus>(
+    networkService.getStatus()
+  );
   const [isOfflineMode, setIsOfflineMode] = useState<boolean>(!networkStatus.isOnline);
+  const connectionRef = useRef<LiveClient | null>(null);
 
   // Listen for network status changes
-  React.useEffect(() => {
+  useEffect(() => {
     const handleNetworkChange = (status: NetworkStatus) => {
       setNetworkStatus(status);
       setIsOfflineMode(!status.isOnline);
@@ -70,32 +78,66 @@ const DeepgramContextProvider: FunctionComponent<
    * @param endpoint - The optional endpoint URL for the Deepgram service.
    * @returns A Promise that resolves when the connection is established.
    */
-  const connectToDeepgram = async (options: LiveSchema, endpoint?: string) => {
-    const token = await getToken();
-    const deepgram = createClient({ accessToken: token });
+  const connectToDeepgram = useCallback(
+    async (options: LiveSchema, endpoint?: string) => {
+      if (isOfflineMode) {
+        return;
+      }
 
-    const conn = deepgram.listen.live(options, endpoint);
+      if (connectionRef.current) {
+        connectionRef.current.finish();
+      }
 
-    // Set connecting state immediately
-    setConnectionState(LiveConnectionState.CONNECTING);
+      setConnectionState(LiveConnectionState.CONNECTING);
 
-    conn.addListener(LiveTranscriptionEvents.Open, () => {
-      setConnectionState(LiveConnectionState.OPEN);
-    });
+      try {
+        const token = await getToken();
+        const deepgram = createClient({ accessToken: token });
+        const conn = deepgram.listen.live(options, endpoint);
 
-    conn.addListener(LiveTranscriptionEvents.Close, () => {
-      setConnectionState(LiveConnectionState.CLOSED);
-    });
+        conn.addListener(LiveTranscriptionEvents.Open, () => {
+          if (connectionRef.current === conn) {
+            setConnectionState(LiveConnectionState.OPEN);
+          }
+        });
 
-    setConnection(conn);
-  };
+        conn.addListener(LiveTranscriptionEvents.Close, () => {
+          if (connectionRef.current === conn) {
+            connectionRef.current = null;
+            setConnection(null);
+            setConnectionState(LiveConnectionState.CLOSED);
+          }
+        });
 
-  const disconnectFromDeepgram = async () => {
-    if (connection) {
-      connection.finish();
-      setConnection(null);
+        connectionRef.current = conn;
+        setConnection(conn);
+      } catch (error) {
+        console.error("Failed to connect to Deepgram:", error);
+        connectionRef.current = null;
+        setConnection(null);
+        setConnectionState(LiveConnectionState.CLOSED);
+      }
+    },
+    [isOfflineMode]
+  );
+
+  const disconnectFromDeepgram = useCallback(async () => {
+    if (connectionRef.current) {
+      connectionRef.current.finish();
+      connectionRef.current = null;
     }
-  };
+    setConnection(null);
+    setConnectionState(LiveConnectionState.CLOSED);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (connectionRef.current) {
+        connectionRef.current.finish();
+        connectionRef.current = null;
+      }
+    };
+  }, []);
 
   return (
     <DeepgramContext.Provider

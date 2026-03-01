@@ -4,6 +4,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useState,
   ReactNode,
 } from "react";
@@ -12,7 +13,7 @@ interface MicrophoneContextType {
   microphone: MediaRecorder | null;
   startMicrophone: () => void;
   stopMicrophone: () => void;
-  setupMicrophone: () => void;
+  setupMicrophone: () => Promise<void>;
   microphoneState: MicrophoneState | null;
 }
 
@@ -44,15 +45,17 @@ interface MicrophoneContextProviderProps {
   children: ReactNode;
 }
 
-const MicrophoneContextProvider: React.FC<MicrophoneContextProviderProps> = ({
-  children,
-}) => {
+const MicrophoneContextProvider = ({ children }: MicrophoneContextProviderProps) => {
   const [microphoneState, setMicrophoneState] = useState<MicrophoneState>(
     MicrophoneState.NotSetup
   );
   const [microphone, setMicrophone] = useState<MediaRecorder | null>(null);
 
-  const setupMicrophone = async () => {
+  const setupMicrophone = useCallback(async () => {
+    if (microphone) {
+      return;
+    }
+
     setMicrophoneState(MicrophoneState.SettingUp);
 
     try {
@@ -67,32 +70,58 @@ const MicrophoneContextProvider: React.FC<MicrophoneContextProviderProps> = ({
 
       setMicrophoneState(MicrophoneState.Ready);
       setMicrophone(microphone);
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error(err);
-
-      throw err;
-    }
-  };
-
-  const stopMicrophone = useCallback(() => {
-    setMicrophoneState(MicrophoneState.Pausing);
-
-    if (microphone?.state === "recording") {
-      microphone.pause();
-      setMicrophoneState(MicrophoneState.Paused);
+      setMicrophoneState(MicrophoneState.Error);
     }
   }, [microphone]);
 
+  const stopMicrophone = useCallback(() => {
+    if (!microphone) {
+      return;
+    }
+
+    setMicrophoneState(MicrophoneState.Pausing);
+
+    if (microphone.state === "recording") {
+      microphone.pause();
+      setMicrophoneState(MicrophoneState.Paused);
+      return;
+    }
+
+    if (microphone.state === "paused") {
+      setMicrophoneState(MicrophoneState.Paused);
+      return;
+    }
+
+    setMicrophoneState(MicrophoneState.Ready);
+  }, [microphone]);
+
   const startMicrophone = useCallback(() => {
+    if (!microphone) {
+      setMicrophoneState(MicrophoneState.NotSetup);
+      return;
+    }
+
     setMicrophoneState(MicrophoneState.Opening);
 
-    if (microphone?.state === "paused") {
+    if (microphone.state === "paused") {
       microphone.resume();
     } else {
-      microphone?.start(250);
+      microphone.start(250);
     }
 
     setMicrophoneState(MicrophoneState.Open);
+  }, [microphone]);
+
+  useEffect(() => {
+    if (!microphone) {
+      return;
+    }
+
+    return () => {
+      microphone.stream.getTracks().forEach((track) => track.stop());
+    };
   }, [microphone]);
 
   return (

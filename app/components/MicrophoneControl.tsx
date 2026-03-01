@@ -35,7 +35,13 @@ const MicrophoneControl = () => {
 
   // Keyboard shortcut for spacebar
   const handleKeyPress = useCallback((event: KeyboardEvent) => {
-    if (event.code === 'Space' && isReady && isConnected) {
+    const target = event.target as HTMLElement | null;
+    const isTypingTarget =
+      target?.tagName === "INPUT" ||
+      target?.tagName === "TEXTAREA" ||
+      target?.isContentEditable;
+
+    if (event.code === 'Space' && !event.repeat && !isTypingTarget && isReady && isConnected) {
       event.preventDefault();
       if (isRecording) {
         stopMicrophone();
@@ -64,6 +70,7 @@ const MicrophoneControl = () => {
     <div className="fixed inset-0 flex items-center justify-center z-20">
       <div className="text-center">
         <button
+          type="button"
           onClick={handleToggleRecording}
           disabled={!isReady || !isConnected}
           className={`
@@ -91,7 +98,7 @@ const MicrophoneControl = () => {
 
           {/* Status indicator */}
           <div className={`
-            absolute -bottom-2 -right-2 w-6 h-6 rounded-full border-3 border-white
+            absolute -bottom-2 -right-2 w-6 h-6 rounded-full border-2 border-white
             ${isRecording ? 'bg-green-400 animate-pulse' : 'bg-gray-400'}
           `}></div>
         </button>
@@ -114,4 +121,4 @@ const MicrophoneControl = () => {
   );
 };
 
-export default MicrophoneControl; 
+export default MicrophoneControl;

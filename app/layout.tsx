@@ -23,9 +23,10 @@ export const viewport: Viewport = {
 };
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://aura-tts-demo.deepgram.com"),
-  title: "Deepgram AI Agent",
-  description: `Deepgram's AI Agent Demo shows just how fast Speech-to-Text and Text-to-Speech can be.`,
+  metadataBase: new URL("https://nextjs-live-transcription.vercel.app"),
+  title: "Live Transcription",
+  description:
+    "Real-time speech transcription with Deepgram, including offline capture and sync support.",
   robots: {
     index: false,
     follow: false,

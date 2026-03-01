@@ -1,4 +1,4 @@
-import { indexedDBService, AudioSegment, PendingTranscript } from './IndexedDBService';
+import { indexedDBService } from './IndexedDBService';
 import { networkService } from './NetworkService';
 
 export interface SyncResult {
@@ -19,8 +19,6 @@ class OfflineTranscriptionService {
   private isProcessing = false;
   private maxRetries = 3;
   private syncInterval: NodeJS.Timeout | null = null;
-  private reconnectAttempts = 0;
-  private maxReconnectAttempts = 5;
 
   constructor() {
     this.setupNetworkListener();
@@ -29,9 +27,7 @@ class OfflineTranscriptionService {
   private setupNetworkListener() {
     networkService.addListener((status) => {
       if (status.isOnline && !this.isProcessing) {
-        // When back online, start processing pending transcripts
-        this.reconnectAttempts = 0;
-        this.processPendingTranscripts();
+        void this.processPendingTranscripts();
       }
     });
   }
@@ -72,8 +68,6 @@ class OfflineTranscriptionService {
         return result;
       }
 
-      console.log(`Processing ${pendingTranscripts.length} pending transcripts...`);
-      
       for (const pending of pendingTranscripts) {
         try {
           // Skip if too many retries
@@ -102,7 +96,6 @@ class OfflineTranscriptionService {
             await indexedDBService.markAudioSegmentAsProcessed(audioSegment.id, transcript);
             await indexedDBService.removePendingTranscript(pending.id);
             result.processedCount++;
-            console.log(`Successfully processed segment ${pending.audioSegmentId}: "${transcript}"`);
           } else {
             // Increment retry count
             await indexedDBService.incrementRetryCount(pending.id);
@@ -122,10 +115,6 @@ class OfflineTranscriptionService {
       this.isProcessing = false;
     }
 
-    if (result.processedCount > 0) {
-      console.log(`Successfully processed ${result.processedCount} transcripts`);
-    }
-
     return result;
   }
 
@@ -134,14 +123,19 @@ class OfflineTranscriptionService {
       // Check network status before attempting transcription
       const networkStatus = networkService.getStatus();
       if (!networkStatus.isOnline) {
-        console.log('Network is offline, skipping transcription');
         return null;
       }
 
       // Get authentication token
       const response = await fetch('/api/authenticate', { cache: 'no-store' });
+      if (!response.ok) {
+        throw new Error(`Authentication failed: ${response.status}`);
+      }
       const result = await response.json();
       const token = result.access_token;
+      if (!token) {
+        throw new Error('Missing Deepgram access token');
+      }
 
       // Create form data for the audio file
       const formData = new FormData();
@@ -174,20 +168,11 @@ class OfflineTranscriptionService {
       return null;
     } catch (error) {
       console.error('Error transcribing audio segment:', error);
-      
-      // If it's a network error, we might want to retry later
-      if (error instanceof TypeError && error.message.includes('fetch')) {
-        this.reconnectAttempts++;
-        if (this.reconnectAttempts < this.maxReconnectAttempts) {
-          console.log(`Network error, will retry. Attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts}`);
-        }
-      }
-      
       return null;
     }
   }
 
-  async startAutoSync(intervalMs: number = 30000): Promise<void> {
+  startAutoSync(intervalMs: number = 30000): Promise<void> {
     if (this.syncInterval) {
       clearInterval(this.syncInterval);
     }
@@ -198,6 +183,8 @@ class OfflineTranscriptionService {
         await this.processPendingTranscripts();
       }
     }, intervalMs);
+
+    return Promise.resolve();
   }
 
   stopAutoSync(): void {
@@ -225,9 +212,8 @@ class OfflineTranscriptionService {
 
   // Force sync all pending transcripts
   async forceSync(): Promise<SyncResult> {
-    console.log('Force syncing all pending transcripts...');
     return await this.processPendingTranscripts();
   }
 }
 
-export const offlineTranscriptionService = new OfflineTranscriptionService(); 
+export const offlineTranscriptionService = new OfflineTranscriptionService();
